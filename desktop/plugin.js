@@ -5,13 +5,320 @@
 //
 // Audio leaves this window as 16 kHz s16le frames over a sibling WebSocket; the Gemini
 // key is never sent here and never read here. The relay owns it.
-import { icons, resolveSiblingWsUrl } from '@hermes/plugin-sdk'
+import { host, icons, resolveSiblingWsUrl, Dialog, DialogContent, DialogTitle, DialogDescription } from '@hermes/plugin-sdk'
 import { createElement as h, useEffect, useState } from 'react'
 
 const RELAY_PATH = '/api/plugins/hermes-gemini-live/relay'
 const SEND_RATE = 16000
 const SEND_CHUNK = 1600
 const DEFAULT_TUNING = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, halfDuplex: false }
+
+// Read-only Hermes history has its own lifetime; it never opens a paid Live socket.
+const taskHistory = { rows: [], selected: '', detail: null, open: false, error: '', busy: false }
+const conversationView = { busy: false, revisions: new Map(), status: '', activity: '', progress: '', problem: '', updatedAt: 0, toolCount: 0, error: '' }
+
+// Native receipts belong to the conversation, never to the paid audio socket.
+const NATIVE_KEY = 'hermes-gemini-native-v1'
+let nativeReceipts = []
+try { nativeReceipts = JSON.parse(localStorage.getItem(NATIVE_KEY) || '[]') } catch {}
+const nativePending = new Map()
+function saveNative () { localStorage.setItem(NATIVE_KEY, JSON.stringify(nativeReceipts.slice(-200))) }
+function nativeOwner () { return host.state.focusedSessionOwner?.get() }
+function sameOwner (a, b) { return a?.connectionId === b?.connectionId && a?.profile === b?.profile }
+async function nativeRoute (owner) {
+  const routes = await host.profileRoutes()
+  const route = routes.find(r => sameOwner(r, owner))
+  if (!route) throw new Error('The native conversation owner is unavailable.')
+  return route
+}
+function nativeTasks () {
+  const sid = host.state.focusedStoredSessionId.get(), owner = nativeOwner()
+  return nativeReceipts.filter(r => (r.sid === sid || r.aliases?.includes(sid)) && sameOwner(r.owner, owner) && !r.correction)
+}
+function nativeView (task) {
+  if (!task) return
+  conversationView.status = task.status
+  conversationView.activity = task.activity || ''
+  conversationView.progress = task.progress || task.output || ''
+  conversationView.updatedAt = task.updatedAt || Date.now()
+  conversationView.error = task.status === 'uncertain' ? 'Delivery uncertain; check the chat before retrying.' : ''
+  publish()
+}
+function nativeEvent (event) {
+  for (const task of nativeReceipts.filter(r => !r.correction && ['submitted', 'running', 'waiting_for_user', 'waiting_for_approval'].includes(r.status))) {
+    if (event.session_id !== task.runtime || (event.connectionId && event.connectionId !== task.owner.connectionId) ||
+        (event.profile && event.profile !== task.owner.profile)) continue
+    if (event.replayed || (event.seq && task.seq >= event.seq)) continue
+    if (event.seq) task.seq = event.seq
+    const p = event.payload || {}
+    if (event.type === 'message.start') { task.status = 'running'; nativePending.get(task.id)?.(true) }
+    if (event.type === 'message.interim') task.progress = String(p.text || '').slice(-1200)
+    if (event.type === 'message.delta') task.progress = ((task.progress || '') + (p.text || '')).slice(-1200)
+    if (event.type === 'tool.start' || event.type === 'tool.complete') {
+      task.activity = String(p.name || 'Tool').replaceAll('_', ' ') + (event.type === 'tool.complete' ? ' · result received' : '')
+      task.toolIds = [...new Set([...(task.toolIds || []), p.tool_id].filter(Boolean))]
+    }
+    if (['approval.request', 'clarify.request', 'secret.request', 'sudo.request'].includes(event.type)) {
+      task.status = event.type === 'clarify.request' ? 'waiting_for_user' : 'waiting_for_approval'
+      task.activity = 'Answer the native request in this chat'
+    }
+    if (event.type === 'message.complete') {
+      task.status = p.status === 'error' ? 'failed' : p.status === 'interrupted' ? 'interrupted' : 'completed'
+      task.output = typeof p.text === 'string' ? p.text.slice(-6000) : JSON.stringify(p.text)
+      task.progress = task.output
+      const ws = call.socket
+      if (ws?.readyState === WebSocket.OPEN && nativeTasks().includes(task)) ws.send(JSON.stringify({ type: 'native_notice', text: 'Existing Hermes task ' + task.id + ' ' + task.status + '. Result DATA: ' + task.output + '\nSpeak a short summary only; do not start another task.' }))
+    }
+    task.updatedAt = Date.now()
+    saveNative()
+    if (nativeTasks().includes(task)) nativeView(task)
+  }
+}
+async function nativeCommand (command) {
+  const { id, action, payload = {} } = command
+  const previous = nativeReceipts.find(r => r.id === id)
+  if (previous) {
+    const sid = host.state.focusedStoredSessionId.get()
+    if (!sameOwner(previous.owner, nativeOwner()) || (previous.sid !== sid && !previous.aliases?.includes(sid))) return { status: 'rejected', detail: 'Receipt belongs to another conversation.' }
+    return previous.result || { status: previous.status, task_id: previous.task_id || previous.id }
+  }
+  if (action === 'board') return { status: 'ok', tasks: nativeTasks().map(r => ({ task_id: r.id, status: r.status, prompt: r.prompt, output: r.output, progress: r.progress, activity: r.activity })) }
+  const sid = host.state.focusedStoredSessionId.get(), runtime = host.state.focusedSessionId.get(), owner = nativeOwner()
+  if (!sid || !runtime || !owner || (call.conversationId && sid !== call.conversationId)) return { status: 'rejected', detail: 'The exact owning conversation is not available.' }
+  const text = String(payload.text || '').trim()
+  const active = nativeTasks().findLast(r => ['running', 'submitted', 'waiting_for_user', 'waiting_for_approval'].includes(r.status))
+  const requested = payload.task_id ? nativeTasks().find(r => r.id === payload.task_id) : active
+  if (action !== 'submit' && !requested) return { status: 'rejected', detail: 'Task does not belong to this conversation.' }
+  if (action === 'stop' || action === 'deny') return { status: 'rejected', detail: 'Use the native Stop or approval controls in this chat. End voice only ends audio.' }
+  if (!text) return { status: 'rejected', detail: 'No task text supplied.' }
+  // Persist intent BEFORE dispatch; an uncertain delivery is never replayed automatically.
+  const record = { id, sid, runtime, owner, prompt: text, status: 'submitted', createdAt: Date.now(), updatedAt: Date.now() }
+  nativeReceipts.push(record); saveNative()
+  try {
+    if (host.state.busy.get()) {
+      if (requested && requested.runtime !== runtime) throw new Error('Task runtime changed; reconnect before steering.')
+      const task = requested || record
+      const response = await host.requestProfile(await nativeRoute(owner), 'session.steer', { session_id: runtime, text })
+      if (response.status !== 'queued') throw new Error('Native turn did not accept steering; no extra run was started.')
+      record.correction = task !== record
+      record.task_id = task.id
+      record.status = 'running'
+      record.result = { status: 'steered', task_id: task.id }
+      task.activity = 'Steering accepted by the running Hermes task'
+      nativeView(task)
+    } else {
+      if (action === 'steer') throw new Error('That task is no longer running; no new task was started.')
+      // Listen before dispatch. message.start is a gateway acknowledgment, not optimistic UI busy.
+      let timer
+      const accepted = new Promise(resolve => { nativePending.set(id, resolve); timer = setTimeout(() => resolve(false), 20000) })
+      // The event tap stores callbacks in a Set. Reusing nativeEvent here
+      // would let temporary cleanup remove the permanent progress listener.
+      const dispose = host.onEvent('*', event => nativeEvent(event))
+      try {
+        if (!host.composer.submit(sid, text)) throw new Error('No exact native composer accepted delivery.')
+        if (!await accepted) { record.status = 'uncertain'; record.result = { status: 'uncertain', task_id: id, detail: 'No native start acknowledgment. Check the chat; do not retry automatically.' } }
+        else { record.status = 'running'; record.result = { status: 'running', task_id: id } }
+      } finally { clearTimeout(timer); nativePending.delete(id); dispose() }
+      nativeView(record)
+    }
+  } catch (error) {
+    record.status = 'rejected'; record.result = { status: 'rejected', detail: message(error) }
+  }
+  saveNative()
+  return record.result
+}
+
+function describeActivity (messages) {
+  const publicNote = [...messages].reverse().find(row => row.role === 'assistant' &&
+    typeof (row.display_content || row.content) === 'string' && (row.display_content || row.content).trim())
+  const progress = publicNote ? (publicNote.display_content || publicNote.content).replace(/\s+/g, ' ').trim().slice(0, 260) : ''
+  const calls = messages.flatMap(row => toolCalls(row))
+  const tool = calls.at(-1)
+  if (!tool) return { description: '', progress, problem: '', pendingTool: false, toolCount: 0 }
+  const name = tool.function?.name || tool.name || 'tool'
+  let args = tool.function?.arguments || tool.arguments || {}
+  try { if (typeof args === 'string') args = JSON.parse(args) } catch { args = {} }
+  const path = args.path || args.file_path || args.filepath || ''
+  const file = String(path).split(/[\\/]/).at(-1)
+  const verbs = { read_file: 'Reading', write_file: 'Writing', patch: 'Editing', terminal: 'Running command', execute_code: 'Running code', web_search: 'Searching the web', browser: 'Using browser' }
+  const description = (verbs[name] || name.replaceAll('_', ' ')) + (file ? ' ' + file : '')
+  const result = [...messages].reverse().find(row => row.role === 'tool' && row.tool_call_id === tool.id)
+  let payload = result?.content || {}
+  try { if (typeof payload === 'string') payload = JSON.parse(payload) } catch { payload = {} }
+  const problem = payload?.stale_write_blocked ? 'File update blocked: read the full current file before replacing it.'
+    : payload?.error ? 'Tool reported an error; see its result in the thread.' : ''
+  return { description, progress, problem, pendingTool: !result, toolCount: calls.length }
+}
+
+async function ensureConversation (rest) {
+  let sid = host.state.focusedStoredSessionId.get()
+  if (!sid) {
+    const created = await host.requestProfile(await nativeRoute(nativeOwner()), 'session.create', { source: 'desktop' })
+    sid = created.stored_session_id
+    if (!sid) throw new Error('Native conversation creation was not acknowledged.')
+    await host.openSession(sid, { profile: host.state.focusedSessionProfile.get(), awaitHydration: true, intent: 'in-place' })
+  }
+  return sid
+}
+
+async function refreshConversation (rest) {
+  const sid = host.state.focusedStoredSessionId.get()
+  const native = nativeTasks().at(-1)
+  if (native) {
+    nativeView(native)
+    // Native events own live rendering. Read persisted history only to recover
+    // an attached turn's final acknowledgment after a renderer/plugin reload.
+    if (['submitted', 'running', 'uncertain'].includes(native.status) && !host.state.busy.get() && !conversationView.busy) {
+      conversationView.busy = true
+      try {
+        const prompts = nativeReceipts.filter(r => r.id === native.id || r.task_id === native.id).map(r => r.prompt)
+        const recovered = await rest('/conversations/' + encodeURIComponent(sid) + '/native-completion', {
+          method: 'POST', body: { since: (native.createdAt || native.updatedAt) / 1000, prompts } })
+        if (recovered.completion && !host.state.busy.get()) {
+          native.status = recovered.completion.status
+          native.output = recovered.completion.output
+          native.progress = native.output
+          native.updatedAt = recovered.completion.timestamp * 1000
+          saveNative(); nativeView(native)
+        }
+      } catch { /* No confirmed final means pending, never a new coding run. */ }
+      finally { conversationView.busy = false }
+    }
+    return
+  }
+  if (!sid || conversationView.busy) return
+  conversationView.busy = true
+  try {
+    const data = await rest('/tasks?conversation_id=' + encodeURIComponent(sid))
+    const rows = (data.tasks || []).filter(row => row.conversation_id === sid)
+    if (!rows.length) { conversationView.status = ''; conversationView.progress = ''; conversationView.activity = ''; conversationView.problem = ''; return }
+    const detail = await rest('/tasks/' + encodeURIComponent(rows[0].run_id))
+    if (host.state.focusedStoredSessionId.get() !== sid) return
+    conversationView.status = detail.status
+    const messages = detail.messages || []
+    const currentMessages = messages.filter(row => !row.timestamp || row.timestamp >= (rows[0].created_at || 0) - 1)
+    const activity = describeActivity(currentMessages)
+    conversationView.activity = activity.description + (activity.description && !activity.pendingTool ? ' · result received' : '')
+    conversationView.progress = activity.progress
+    conversationView.problem = activity.problem
+    conversationView.toolCount = activity.toolCount
+    const revision = [rows[0].run_id, detail.status, messages.length, messages.at(-1)?.id, messages.at(-1)?.content?.length].join('/')
+    if (conversationView.revisions.get(sid) !== revision) {
+      conversationView.updatedAt = currentMessages.at(-1)?.timestamp ? currentMessages.at(-1).timestamp * 1000 : Date.now()
+    }
+    if (conversationView.revisions.get(sid) !== revision && !host.state.busy.get()) {
+      // The SDK refreshes the native transcript in place; it never opens a window,
+      // changes focus, sends a new prompt, or starts another model turn.
+      await host.openSession(sid, { refreshInPlace: true, awaitHydration: true,
+        profile: host.state.focusedSessionProfile.get() })
+      conversationView.revisions.set(sid, revision)
+    }
+    conversationView.error = ''
+  } catch (error) {
+    conversationView.error = message(error)
+  } finally {
+    conversationView.busy = false
+    publish()
+  }
+}
+
+function ConversationProgress () {
+  useCall()
+  const state = conversationView.status
+  if (!state && !conversationView.error) return null
+  const active = ['submitted', 'queued', 'running', 'waiting_for_approval'].includes(state)
+  const seconds = conversationView.updatedAt ? Math.max(0, Math.floor((Date.now() - conversationView.updatedAt) / 1000)) : 0
+  const age = seconds < 60 ? seconds + 's' : Math.floor(seconds / 60) + 'm ' + seconds % 60 + 's'
+  const label = conversationView.error ? 'Progress connection unavailable'
+    : state === 'queued' || state === 'submitted' ? 'Hermes queued'
+      : state === 'waiting_for_approval' ? 'Hermes needs approval'
+        : active ? 'Hermes working' : 'Hermes · ' + state
+  return h('div', { 'data-gemini-work-status': '',
+    style: { order: -1, boxSizing: 'border-box', width: 'calc(100% - 10px)', margin: '0 5px 8px', padding: '9px 12px', borderRadius: '10px', border: '1px solid color-mix(in srgb, currentColor 18%, transparent)', background: 'color-mix(in srgb, var(--dt-input) 94%, currentColor 6%)', fontSize: '12px', minWidth: 0 },
+    title: 'Real run status and visible progress from this conversation. Voice can be off.' },
+    h('style', null, '[data-slot="composer-dock"] > div:has(> [data-gemini-work-status]){display:contents} @keyframes gemini-work-pulse{50%{opacity:.35}} @media(prefers-reduced-motion:reduce){[data-gemini-work-dot]{animation:none!important}}'),
+    h('div', { role: 'status', style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+      h('span', { 'data-gemini-work-dot': '', 'aria-hidden': 'true', style: { width: '7px', height: '7px', flexShrink: 0, borderRadius: '50%', background: conversationView.problem || conversationView.error ? '#d99a35' : active ? '#65a8ed' : '#74ad84', animation: active ? 'gemini-work-pulse 1.5s ease-in-out infinite' : 'none' } }),
+      h('strong', null, label),
+      h('span', { style: { marginLeft: 'auto', opacity: .65, fontSize: '11px' } }, conversationView.updatedAt ? 'Updated ' + age + ' ago' : '')),
+    conversationView.activity && h('div', { style: { marginTop: '4px', opacity: .85, overflowWrap: 'anywhere' } }, conversationView.activity),
+    conversationView.progress && h('div', { style: { marginTop: '4px', opacity: .75, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' } }, conversationView.progress),
+    conversationView.problem && h('div', { style: { marginTop: '4px', color: '#d99a35' } }, conversationView.problem))
+}
+
+async function refreshTasks (rest) {
+  if (taskHistory.busy) return
+  taskHistory.busy = true
+  try {
+    const data = await rest('/tasks')
+    taskHistory.rows = data.tasks || []
+    if (!taskHistory.selected && taskHistory.rows.length) taskHistory.selected = taskHistory.rows[0].run_id
+    if (taskHistory.open && taskHistory.selected) {
+      const selected = taskHistory.selected
+      const detail = await rest('/tasks/' + encodeURIComponent(selected))
+      if (taskHistory.selected === selected) taskHistory.detail = detail
+    }
+    taskHistory.error = ''
+  } catch (error) {
+    taskHistory.error = message(error)
+  } finally {
+    taskHistory.busy = false
+    publish()
+  }
+}
+
+function toolCalls (row) {
+  try { return typeof row.tool_calls === 'string' ? JSON.parse(row.tool_calls) : (row.tool_calls || []) } catch { return [] }
+}
+
+function displayText (value) {
+  return typeof value === 'string' ? value : JSON.stringify(value, null, 2)
+}
+
+function TaskHistoryControl ({ rest }) {
+  useCall()
+  const detail = taskHistory.detail
+  const button = h('button', {
+    type: 'button', 'aria-label': 'Gemini tasks',
+    title: 'Hermes task progress, tool calls and results — works with voice off',
+    className: 'rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted',
+    onClick: () => { taskHistory.open = true; publish(); void refreshTasks(rest) }
+  }, 'Gemini tasks', taskHistory.rows.length ? ` (${taskHistory.rows.length})` : '')
+  return h('div', { className: 'inline-flex' }, button,
+    h(Dialog, { open: taskHistory.open, onOpenChange: value => { taskHistory.open = value; publish() } },
+      h(DialogContent, { style: { width: 'min(1000px, 92vw)', maxWidth: '1000px', maxHeight: '85vh', overflow: 'auto' } },
+        h(DialogTitle, null, 'Gemini tasks · Hermes / Hermes'),
+        h(DialogDescription, null, 'Voice can be off. Submitted Hermes tasks continue; reopen voice to ask about or steer an existing task.'),
+        taskHistory.error && h('p', { role: 'alert' }, 'Task history unavailable: ' + taskHistory.error),
+        !taskHistory.rows.length && h('p', null, 'No delegated tasks recorded yet.'),
+        h('div', { style: { display: 'flex', gap: '16px', alignItems: 'flex-start' } },
+          h('div', { style: { width: '240px', flexShrink: 0 } }, taskHistory.rows.map(row =>
+            h('button', { key: row.run_id, type: 'button',
+              'aria-pressed': taskHistory.selected === row.run_id,
+              className: 'mb-2 block w-full rounded border p-2 text-left text-sm hover:bg-muted',
+              onClick: () => { taskHistory.selected = row.run_id; taskHistory.detail = null; publish(); void refreshTasks(rest) }
+            }, row.prompt.split('\n')[0], h('small', { className: 'block text-muted-foreground' },
+              row.status + ' · ' + new Date(row.created_at * 1000).toLocaleTimeString())))),
+          h('div', { style: { flex: 1, minWidth: 0 }, 'aria-label': 'Hermes task transcript' },
+            !detail && taskHistory.rows.length ? h('p', null, 'Loading task transcript…') : null,
+            detail && h('div', null,
+              h('p', { role: 'status' }, 'Status: ' + detail.status + ' · Executing model: ' + (detail.session?.model || 'waiting for model')),
+              h('small', { className: 'block text-muted-foreground' }, 'Session: ' + detail.session_id),
+              detail.status_detail && h('p', { role: 'alert' }, detail.status_detail),
+              detail.transcript_detail && h('p', null, detail.transcript_detail),
+              detail.error && h('p', { role: 'alert' }, displayText(detail.error)),
+              detail.messages?.map((row, index) => h('div', { key: row.id || index, className: 'my-3 border-b pb-2' },
+                h('strong', null, row.role === 'tool' ? 'Tool result · ' + (row.tool_name || '') : row.role === 'user' ? 'Task' : 'Hermes'),
+                (row.display_content || row.content) && h('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: '12px' } }, displayText(row.display_content || row.content)),
+                toolCalls(row).map((tool, i) => h('details', { key: i, className: 'my-2' },
+                  h('summary', null, 'Tool call · ' + (tool.function?.name || tool.name || 'tool')),
+                  h('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: '12px' } }, displayText(tool.function?.arguments || tool.arguments || {}))))
+              )),
+              detail.output && h('section', { className: 'mt-3 rounded border p-3' }, h('strong', null, 'Result'),
+                h('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } }, displayText(detail.output))),
+              detail.pagination?.has_more && h('p', null, 'Showing the latest 500 transcript entries.')
+            ))))))
+}
 
 const WORKLET_SOURCE = `
 class ResampleToPcm extends AudioWorkletProcessor {
@@ -140,9 +447,10 @@ async function startCapture (onChunk, tuning) {
   }
 }
 
-/** Playback for the model's 24 kHz speech, flushed the moment the user talks over it. */
-function createPlayer () {
+/** Stream each 24kHz chunk immediately at native pitch; never wait for task completion. */
+async function createPlayer () {
   const context = new AudioContext()
+  await context.resume()
   const gain = context.createGain()
   const analyser = context.createAnalyser()
   analyser.fftSize = 512
@@ -235,7 +543,7 @@ const call = {
   status: null,
   muted: false,
   socket: null, player: null, stopCapture: null,
-  lastAudio: 0, lastInText: 0, startedAt: 0, taskAt: 0, micPeak: 0,
+  lastAudio: 0, lastInText: 0, awaitingReply: false, startedAt: 0, taskAt: 0, micPeak: 0,
   tuning: DEFAULT_TUNING, raf: 0, listeners: new Set()
 }
 
@@ -341,7 +649,13 @@ function receive (event) {
   } catch {
     return
   }
-  if (frame.type === 'audio') {
+  if (frame.type === 'native_request') {
+    // A queued frame from an ended call cannot target a newly focused chat.
+    if (event.target !== call.socket) return
+    const ws = call.socket
+    void nativeCommand(frame).then(result => { if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'native_response', id: frame.id, result })) })
+  } else if (frame.type === 'audio') {
+    call.awaitingReply = false
     call.lastAudio = Date.now()
     call.player?.play(fromBase64(frame.data))
   } else if (frame.type === 'speech_started') {
@@ -351,6 +665,9 @@ function receive (event) {
     // The user's own words are the only honest start of a "thinking" window: an
     // extended-thinking model is silent while it works, and silence alone reads dead.
     call.lastInText = Date.now()
+    call.awaitingReply = true
+  } else if (frame.type === 'turn_complete') {
+    call.awaitingReply = false
   } else if (frame.type === 'task_started') {
     if (!call.taskAt) call.taskAt = Date.now()
     if (!call.pending.includes(frame.id)) call.pending = [...call.pending, frame.id]
@@ -380,8 +697,7 @@ function receive (event) {
     call.detail = frame.detail || 'Hermes refused that'
     publish()
   } else if (frame.type === 'lane') {
-    call.detail = 'Hermes work is unavailable: ' + (frame.detail || frame.status)
-    publish()
+    tearDown('Hermes is temporarily unavailable: ' + (frame.detail || frame.status) + '. Voice ended; existing tasks continue. Try again shortly.')
   } else if (frame.type === 'go_away') {
     call.detail = 'Gemini is ending this session' +
       (frame.timeLeft ? ' (' + frame.timeLeft + ')' : '') + ' — press Start to go on'
@@ -413,15 +729,21 @@ async function start (rest) {
   call.speaking = false
   call.lastAudio = 0
   call.lastInText = 0
+  call.awaitingReply = false
   call.taskAt = 0
   call.startedAt = Date.now()
   beginMeter()
   publish()
   void loadStatus(rest)
-  call.player = call.player || createPlayer()
   let url
   try {
+    call.player = call.player || await createPlayer()
+    call.conversationId = await ensureConversation(rest)
     url = await resolveSiblingWsUrl({}, RELAY_PATH)
+    const target = new URL(url)
+    target.searchParams.set('conversation_id', call.conversationId)
+    target.searchParams.set('native', '1')
+    url = target.toString()
   } catch (error) {
     tearDown(message(error))
     return
@@ -484,7 +806,7 @@ function TalkControl ({ rest }) {
   // one thing the user can act on — so the ask wins the label.
   const waiting = call.waiting.length > 0
   const thinking = call.state === 'live' && !working && !call.speaking &&
-    call.lastInText > 0 && now - call.lastInText < 20000
+    call.awaitingReply
   const busy = working || thinking || call.state === 'connecting'
   const counted = working ? call.taskAt : (thinking ? call.lastInText : call.startedAt)
   const shownSeconds = working || thinking ? (now - counted) / 1000 : call.elapsed
@@ -539,10 +861,11 @@ function TalkControl ({ rest }) {
     h('button', {
       type: 'button',
       'aria-label': 'Stop Gemini Live call',
+      title: 'End paid voice connection; Hermes tasks keep working',
       onClick: () => tearDown(),
       className: 'inline-flex h-6 shrink-0 items-center gap-1 rounded-full px-2 text-[0.6875rem] ' +
         'text-muted-foreground transition-colors hover:bg-muted hover:text-foreground'
-    }, h(icons.VolumeX, { className: icons.iconSize.xs }), 'Stop'))
+    }, h(icons.VolumeX, { className: icons.iconSize.xs }), 'End voice'))
 }
 
 export default {
@@ -550,6 +873,25 @@ export default {
   name: 'Gemini Live',
   defaultEnabled: true,
   register (ctx) {
+    if (host.onEvent) ctx.onDispose(host.onEvent('*', nativeEvent))
+    void refreshConversation(ctx.rest)
+    ctx.setInterval(() => void refreshConversation(ctx.rest), 3000)
+    ctx.onDispose(() => tearDown())
+    const unsubscribe = host.state.focusedStoredSessionId.listen(sid => {
+      const runtime = host.state.focusedSessionId.get()
+      const continuation = nativeReceipts.filter(r => r.runtime === runtime && sameOwner(r.owner, nativeOwner()))
+      for (const task of continuation) { if (sid && sid !== task.sid && !task.aliases?.includes(sid)) task.aliases = [...(task.aliases || []), sid] }
+      if (continuation.length) { saveNative(); if (call.conversationId && continuation.some(r => r.sid === call.conversationId || r.aliases?.includes(call.conversationId))) call.conversationId = sid }
+      if (call.state !== 'idle' && call.conversationId && sid !== call.conversationId) {
+        tearDown('Conversation changed. Voice ended; coding tasks continue.')
+      }
+      conversationView.status = ''; conversationView.activity = ''; conversationView.progress = ''; conversationView.problem = ''; conversationView.error = ''
+      publish()
+      void refreshConversation(ctx.rest)
+    })
+    ctx.onDispose(unsubscribe)
+    ctx.register({ id: 'progress', area: 'composer.underside', order: 39,
+      render: () => h(ConversationProgress) })
     ctx.register({
       id: 'talk',
       area: 'composer.actions',
