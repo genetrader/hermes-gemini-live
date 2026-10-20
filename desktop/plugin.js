@@ -928,10 +928,9 @@ export default {
     ctx.setInterval(() => void refreshConversation(ctx.rest), 3000)
     ctx.onDispose(() => tearDown())
     const unsubscribe = host.state.focusedStoredSessionId.listen(sid => {
-      const runtime = host.state.focusedSessionId.get()
-      const continuation = nativeReceipts.filter(r => r.runtime === runtime && sameOwner(r.owner, nativeOwner()))
-      for (const task of continuation) { if (sid && sid !== task.sid && !task.aliases?.includes(sid)) task.aliases = [...(task.aliases || []), sid] }
-      if (continuation.length) { saveNative(); if (call.conversationId && continuation.some(r => r.sid === call.conversationId || r.aliases?.includes(call.conversationId))) call.conversationId = sid }
+      // Focus changes can arrive before the runtime/owner atoms update. A matching
+      // runtime is not proof of compaction: never alias or move a voice call here.
+      // End audio on every visible chat change; the native model turn stays alive.
       if (call.state !== 'idle' && call.conversationId && sid !== call.conversationId) {
         tearDown('Conversation changed. Voice ended; coding tasks continue.')
       }
