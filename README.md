@@ -46,6 +46,11 @@ Audio relays through Hermes' own backend, which holds the key.
 
 A single-line strip **above the prompt box** shows status, truncated activity and the last update.
 Completed native receipts retire from the voice counter, including after a late/replayed acknowledgment.
+The strip hides after completion; failures and waiting states remain visible. New voice requests
+and corrections have a persistent `Voice request` tag in the native user message. A separate
+badge beside the microphone shows green **Live** only after provider setup and microphone
+capture are ready, amber **Muted**, or neutral **Off**. Missing microphone capture is reported
+separately and never shown as green. Voice connection state does not imply coding activity.
 It does not copy private reasoning or create a second conversation screen. Native Hermes
 continues to render its own tool cards, approvals and final answer.
 
@@ -70,6 +75,7 @@ Run local checks with `python -m pytest -q` and these dependency-free Node suite
 ```bash
 node tests/native-workflow.test.cjs
 node tests/compact-status.test.cjs
+node tests/voice-origin-status.test.cjs
 node tests/conversation-progress.test.cjs
 node tests/task-history.test.cjs
 node tests/playback-speed.test.cjs

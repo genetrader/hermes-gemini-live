@@ -14,7 +14,7 @@ vm.runInContext(`nativeEvent({type:'message.complete',session_id:'r3',profile:'d
 assert.ok(!vm.runInContext('call.pending.includes("t3")',c),'native completion clears voice badge immediately')
 vm.runInContext(`receive({data:JSON.stringify({type:'task_started',id:'t0'})})`,c)
 assert.ok(!vm.runInContext('call.pending.includes("t0")',c),'late or replayed acknowledgments cannot resurrect completed work')
-vm.runInContext(`conversationView.status='completed';conversationView.activity='terminal · result received';conversationView.progress='LONG DUPLICATED ANSWER SHOULD STAY IN CHAT';conversationView.updatedAt=Date.now();`,c)
+vm.runInContext(`conversationView.status='running';conversationView.activity='terminal · result received';conversationView.progress='LONG DUPLICATED ANSWER SHOULD STAY IN CHAT';conversationView.updatedAt=Date.now();`,c)
 const view=vm.runInContext('ConversationProgress()',c)
 assert.ok(!JSON.stringify(view).includes('LONG DUPLICATED ANSWER'),'do not repeat the answer below the chat')
 function find(n,p){if(!n||typeof n!=='object')return; if(p(n))return n;for(const k of n.children||[]){const x=find(k,p);if(x)return x}}

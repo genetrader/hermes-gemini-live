@@ -53,3 +53,16 @@ async def test_relay_native_submission_keeps_transcript_and_never_uses_worker(mo
         transcript='Check exactly 19 rows, preserve all videos.')
     assert '19 rows' in seen[0][2]['text']
     assert seen[-1]['id'] == 'same-native-turn'
+
+@pytest.mark.asyncio
+async def test_native_provider_ready_is_sent_only_after_live_setup(monkeypatch):
+    from hermes_gemini_live import relay
+    from tests.test_relay import FakeLive, FakeBrowser
+    live = FakeLive(end_after_script=False)
+    browser = FakeBrowser([{'type':'close'}])
+    async def opened(*a, **kw):
+        assert not any(f.get('type') == 'ready' for f in browser.sent)
+        return live
+    monkeypatch.setattr(relay.LiveSession, 'open', opened)
+    await relay.run_relay(browser, native=True, conversation_id='chat')
+    assert any(f.get('type') == 'ready' for f in browser.sent)

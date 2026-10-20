@@ -438,6 +438,9 @@ async def run_relay(browser: Any, session_key: str | None = None,
         logger.warning("hermes-gemini-live: call refused: %s", exc)
         await browser.send_text(_dump({"type": "error", "detail": str(exc)}))
         return
+    if native:
+        # LiveSession.open has already received Google's setupComplete.
+        await browser.send_text(_dump({'type': 'ready'}))
     if not offer_tools:
         await browser.send_text(_dump({"type": "lane", "status": lane_status,
                                        "detail": lane_detail}))

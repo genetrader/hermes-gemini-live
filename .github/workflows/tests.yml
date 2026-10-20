@@ -42,6 +42,7 @@ jobs:
         run: |
           node tests/native-workflow.test.cjs
           node tests/compact-status.test.cjs
+          node tests/voice-origin-status.test.cjs
           node tests/conversation-progress.test.cjs
           node tests/task-history.test.cjs
           node tests/playback-speed.test.cjs

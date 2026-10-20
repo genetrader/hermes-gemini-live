@@ -41,6 +41,10 @@ function reconcileNativeIndicators () {
   call.waiting = call.waiting.filter(id => !terminal.has(id))
   if (!call.pending.length) call.taskAt = 0
 }
+function voiceRequestText (text) {
+  const label = '`Voice request`\n\n'
+  return text.startsWith(label) ? text : label + text
+}
 function nativeView (task) {
   if (!task) return
   reconcileNativeIndicators()
@@ -96,7 +100,8 @@ async function nativeCommand (command) {
   }
   const sid = host.state.focusedStoredSessionId.get(), runtime = host.state.focusedSessionId.get(), owner = nativeOwner()
   if (!sid || !runtime || !owner || (call.conversationId && sid !== call.conversationId)) return { status: 'rejected', detail: 'The exact owning conversation is not available.' }
-  const text = String(payload.text || '').trim()
+  const original = String(payload.text || '').trim()
+  const text = original ? voiceRequestText(original) : ''
   const active = nativeTasks().findLast(r => ['running', 'submitted', 'waiting_for_user', 'waiting_for_approval'].includes(r.status))
   const requested = payload.task_id ? nativeTasks().find(r => r.id === payload.task_id) : active
   if (action !== 'submit' && !requested) return { status: 'rejected', detail: 'Task does not belong to this conversation.' }
@@ -237,6 +242,7 @@ function ConversationProgress () {
   useCall()
   const state = conversationView.status
   if (!state && !conversationView.error) return null
+  if (state === 'completed' && !conversationView.error) return null
   const active = ['submitted', 'queued', 'running', 'waiting_for_approval', 'waiting_for_user'].includes(state)
   const seconds = conversationView.updatedAt ? Math.max(0, Math.floor((Date.now() - conversationView.updatedAt) / 1000)) : 0
   const age = seconds < 60 ? seconds + 's' : Math.floor(seconds / 60) + 'm ' + seconds % 60 + 's'
@@ -552,7 +558,7 @@ function VoiceLevelBars ({ level, active }) {
 const call = {
   state: 'idle', detail: '', level: 0, elapsed: 0, speaking: false, pending: [], waiting: [],
   status: null,
-  muted: false,
+  muted: false, providerReady: false, capturePending: false,
   socket: null, player: null, stopCapture: null,
   lastAudio: 0, lastInText: 0, awaitingReply: false, startedAt: 0, taskAt: 0, micPeak: 0,
   tuning: DEFAULT_TUNING, raf: 0, listeners: new Set()
@@ -607,6 +613,8 @@ function tearDown (note) {
   }
   call.player?.flush()
   call.state = 'idle'
+  call.providerReady = false
+  call.capturePending = false
   call.level = 0
   call.speaking = false
   call.pending = []
@@ -660,7 +668,10 @@ function receive (event) {
   } catch {
     return
   }
-  if (frame.type === 'native_request') {
+  if (['ready', 'audio', 'in_text', 'out_text', 'tool_call', 'turn_complete'].includes(frame.type)) call.providerReady = true
+  if (frame.type === 'ready') {
+    publish()
+  } else if (frame.type === 'native_request') {
     // A queued frame from an ended call cannot target a newly focused chat.
     if (event.target !== call.socket) return
     const ws = call.socket
@@ -734,6 +745,7 @@ function answerApproval (choice) {
 async function start (rest) {
   if (call.state !== 'idle') return
   call.state = 'connecting'
+  call.providerReady = false
   call.detail = ''
   call.pending = []
   call.waiting = []
@@ -764,12 +776,18 @@ async function start (rest) {
   call.socket = ws
   ws.onopen = async () => {
     call.state = 'live'
+    call.capturePending = true
     publish()
     try {
-      call.stopCapture = await startCapture(appendChunk, call.tuning)
-    } catch (error) {
-      call.detail = 'microphone unavailable: ' + message(error)
+      const capture = await startCapture(appendChunk, call.tuning)
+      if (call.socket !== ws || ws.readyState !== WebSocket.OPEN) { capture(); return }
+      call.stopCapture = capture
       publish()
+    } catch (error) {
+      if (call.socket !== ws) return
+      call.detail = 'microphone unavailable: ' + message(error)
+    } finally {
+      if (call.socket === ws) { call.capturePending = false; publish() }
     }
   }
   ws.onmessage = receive
@@ -785,6 +803,25 @@ async function start (rest) {
   }
 }
 
+function VoiceConnectionBadge () {
+  useCall()
+  let tone = 'off', label = 'Off', detail = 'Live voice is disconnected'
+  if (call.state !== 'idle') {
+    tone = 'connecting'; label = 'Connecting'; detail = 'Connecting live voice'
+    if (call.state === 'live' && call.providerReady && call.socket?.readyState === WebSocket.OPEN) {
+      if (call.capturePending) { tone = 'connecting'; label = 'Starting mic'; detail = 'Preparing the microphone' }
+      else if (!call.stopCapture) { tone = 'unavailable'; label = 'Mic unavailable'; detail = 'Voice connected, but the microphone is unavailable' }
+      else if (call.muted) { tone = 'muted'; label = 'Muted'; detail = 'Voice connected, microphone muted' }
+      else { tone = 'live'; label = 'Live'; detail = 'Voice connected, microphone on' }
+    }
+  }
+  const color = tone === 'live' ? 'light-dark(#166534, #86efac)' : ['muted', 'unavailable'].includes(tone) ? 'light-dark(#92400e, #fcd34d)' : 'var(--muted-foreground, #6b7280)'
+  return h('span', { 'data-gemini-voice-connection': '', 'data-tone': tone, role: 'status',
+    'aria-label': 'Live voice: ' + detail, title: detail,
+    style: { display: 'inline-flex', alignItems: 'center', gap: '4px', flexShrink: 0, padding: '2px 5px', borderRadius: '5px', fontSize: '11px', lineHeight: '16px', whiteSpace: 'nowrap', color, background: 'color-mix(in srgb, currentColor 8%, transparent)' } },
+    h('span', { 'aria-hidden': 'true', style: { width: '5px', height: '5px', borderRadius: '50%', background: 'currentColor' } }), label)
+}
+
 function TalkControl ({ rest }) {
   useCall()
   const status = call.status
@@ -795,7 +832,7 @@ function TalkControl ({ rest }) {
   }, [rest, status])
 
   if (call.state === 'idle') {
-    return h('button', {
+    return h('div', { className: 'inline-flex items-center gap-1' }, h('button', {
       type: 'button',
       title: call.detail || (blocked && status ? status.detail : 'Start a Gemini Live call'),
       'aria-label': 'Start Gemini Live call',
@@ -803,7 +840,7 @@ function TalkControl ({ rest }) {
       onClick: () => void start(rest),
       className: 'inline-flex size-7 shrink-0 items-center justify-center rounded-full ' +
         'text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50'
-    }, h(icons.Mic, { className: icons.iconSize.sm }))
+    }, h(icons.Mic, { className: icons.iconSize.sm })), h(VoiceConnectionBadge))
   }
 
   // A Hermes run takes tens of seconds and an extended-thinking model goes silent while
@@ -858,6 +895,7 @@ function TalkControl ({ rest }) {
       className: 'inline-flex h-6 shrink-0 items-center rounded-full px-2 text-[0.6875rem] ' +
         'text-muted-foreground transition-colors hover:bg-muted hover:text-foreground'
     }, 'Deny'),
+    h(VoiceConnectionBadge),
     h('button', {
       type: 'button',
       'aria-label': call.muted ? 'Unmute the microphone' : 'Mute the microphone',
