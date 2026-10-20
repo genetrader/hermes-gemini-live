@@ -44,7 +44,8 @@ Audio relays through Hermes' own backend, which holds the key.
 4. Reopen voice and ask for status or give a correction. The task board identifies the existing
    turn; steering targets that runtime rather than starting another API worker.
 
-A compact strip **above the prompt box** shows public progress, tool activity and completion.
+A single-line strip **above the prompt box** shows status, truncated activity and the last update.
+Completed native receipts retire from the voice counter, including after a late/replayed acknowledgment.
 It does not copy private reasoning or create a second conversation screen. Native Hermes
 continues to render its own tool cards, approvals and final answer.
 
@@ -68,6 +69,7 @@ Run local checks with `python -m pytest -q` and these dependency-free Node suite
 
 ```bash
 node tests/native-workflow.test.cjs
+node tests/compact-status.test.cjs
 node tests/conversation-progress.test.cjs
 node tests/task-history.test.cjs
 node tests/playback-speed.test.cjs

@@ -35,8 +35,15 @@ function nativeTasks () {
   const sid = host.state.focusedStoredSessionId.get(), owner = nativeOwner()
   return nativeReceipts.filter(r => (r.sid === sid || r.aliases?.includes(sid)) && sameOwner(r.owner, owner) && !r.correction)
 }
+function reconcileNativeIndicators () {
+  const terminal = new Set(nativeTasks().filter(task => ['completed', 'failed', 'interrupted', 'cancelled', 'rejected'].includes(task.status)).map(task => task.id))
+  call.pending = call.pending.filter(id => !terminal.has(id))
+  call.waiting = call.waiting.filter(id => !terminal.has(id))
+  if (!call.pending.length) call.taskAt = 0
+}
 function nativeView (task) {
   if (!task) return
+  reconcileNativeIndicators()
   conversationView.status = task.status
   conversationView.activity = task.activity || ''
   conversationView.progress = task.progress || task.output || ''
@@ -82,7 +89,11 @@ async function nativeCommand (command) {
     if (!sameOwner(previous.owner, nativeOwner()) || (previous.sid !== sid && !previous.aliases?.includes(sid))) return { status: 'rejected', detail: 'Receipt belongs to another conversation.' }
     return previous.result || { status: previous.status, task_id: previous.task_id || previous.id }
   }
-  if (action === 'board') return { status: 'ok', tasks: nativeTasks().map(r => ({ task_id: r.id, status: r.status, prompt: r.prompt, output: r.output, progress: r.progress, activity: r.activity })) }
+  if (action === 'board') {
+    reconcileNativeIndicators()
+    publish()
+    return { status: 'ok', tasks: nativeTasks().map(r => ({ task_id: r.id, status: r.status, prompt: r.prompt, output: r.output, progress: r.progress, activity: r.activity })) }
+  }
   const sid = host.state.focusedStoredSessionId.get(), runtime = host.state.focusedSessionId.get(), owner = nativeOwner()
   if (!sid || !runtime || !owner || (call.conversationId && sid !== call.conversationId)) return { status: 'rejected', detail: 'The exact owning conversation is not available.' }
   const text = String(payload.text || '').trim()
@@ -226,24 +237,24 @@ function ConversationProgress () {
   useCall()
   const state = conversationView.status
   if (!state && !conversationView.error) return null
-  const active = ['submitted', 'queued', 'running', 'waiting_for_approval'].includes(state)
+  const active = ['submitted', 'queued', 'running', 'waiting_for_approval', 'waiting_for_user'].includes(state)
   const seconds = conversationView.updatedAt ? Math.max(0, Math.floor((Date.now() - conversationView.updatedAt) / 1000)) : 0
   const age = seconds < 60 ? seconds + 's' : Math.floor(seconds / 60) + 'm ' + seconds % 60 + 's'
   const label = conversationView.error ? 'Progress connection unavailable'
     : state === 'queued' || state === 'submitted' ? 'Hermes queued'
       : state === 'waiting_for_approval' ? 'Hermes needs approval'
+        : state === 'waiting_for_user' ? 'Hermes needs you'
         : active ? 'Hermes working' : 'Hermes · ' + state
+  const detail = conversationView.problem || conversationView.activity || (active ? conversationView.progress : '')
   return h('div', { 'data-gemini-work-status': '',
-    style: { order: -1, boxSizing: 'border-box', width: 'calc(100% - 10px)', margin: '0 5px 8px', padding: '9px 12px', borderRadius: '10px', border: '1px solid color-mix(in srgb, currentColor 18%, transparent)', background: 'color-mix(in srgb, var(--dt-input) 94%, currentColor 6%)', fontSize: '12px', minWidth: 0 },
-    title: 'Real run status and visible progress from this conversation. Voice can be off.' },
+    style: { order: -1, boxSizing: 'border-box', width: 'calc(100% - 10px)', margin: '0 5px 6px', padding: '5px 10px', borderRadius: '8px', border: '1px solid color-mix(in srgb, currentColor 18%, transparent)', background: 'color-mix(in srgb, var(--dt-input) 94%, currentColor 6%)', fontSize: '12px', minWidth: 0 },
+    title: detail || 'Real run status from this conversation. Voice can be off.' },
     h('style', null, '[data-slot="composer-dock"] > div:has(> [data-gemini-work-status]){display:contents} @keyframes gemini-work-pulse{50%{opacity:.35}} @media(prefers-reduced-motion:reduce){[data-gemini-work-dot]{animation:none!important}}'),
-    h('div', { role: 'status', style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+    h('div', { role: 'status', style: { display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 } },
       h('span', { 'data-gemini-work-dot': '', 'aria-hidden': 'true', style: { width: '7px', height: '7px', flexShrink: 0, borderRadius: '50%', background: conversationView.problem || conversationView.error ? '#d99a35' : active ? '#65a8ed' : '#74ad84', animation: active ? 'gemini-work-pulse 1.5s ease-in-out infinite' : 'none' } }),
-      h('strong', null, label),
-      h('span', { style: { marginLeft: 'auto', opacity: .65, fontSize: '11px' } }, conversationView.updatedAt ? 'Updated ' + age + ' ago' : '')),
-    conversationView.activity && h('div', { style: { marginTop: '4px', opacity: .85, overflowWrap: 'anywhere' } }, conversationView.activity),
-    conversationView.progress && h('div', { style: { marginTop: '4px', opacity: .75, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' } }, conversationView.progress),
-    conversationView.problem && h('div', { style: { marginTop: '4px', color: '#d99a35' } }, conversationView.problem))
+      h('strong', { style: { flexShrink: 0, whiteSpace: 'nowrap' } }, label),
+      h('span', { 'data-gemini-work-summary': '', style: { flex: 1, minWidth: 0, opacity: .75, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' } }, detail),
+      h('span', { style: { flexShrink: 0, marginLeft: 'auto', opacity: .65, fontSize: '11px', whiteSpace: 'nowrap' } }, conversationView.updatedAt ? 'Updated ' + age + ' ago' : '')))
 }
 
 async function refreshTasks (rest) {
@@ -671,6 +682,7 @@ function receive (event) {
   } else if (frame.type === 'task_started') {
     if (!call.taskAt) call.taskAt = Date.now()
     if (!call.pending.includes(frame.id)) call.pending = [...call.pending, frame.id]
+    reconcileNativeIndicators()
     publish()
   } else if (frame.type === 'task_done') {
     call.pending = call.pending.filter((id) => id !== frame.id)
